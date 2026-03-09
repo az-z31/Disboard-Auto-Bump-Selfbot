@@ -3,7 +3,9 @@ const fs = require('fs')
 const path = require('path')
 
 const DISBOARD_BOT_ID = '302050872383242240'
+const ONE_HOUR_MS = 60 * 60 * 1000
 const TWO_HOURS_MS = 2 * 60 * 60 * 1000  // 7,200,000 ms
+const DEFAULT_BUMP_INTERVAL_MS = ONE_HOUR_MS
 const RANDOM_DELAY_MS = 5 * 60 * 1000     // 5 minutes random buffer
 const PREFIX = '.'
 
@@ -51,10 +53,12 @@ if (tokens.length !== serverIds.length) {
 
 // Store all bot instances
 const bots = []
+const serverState = new Map()
 
 // Pair tokens with server IDs
 for (let i = 0; i < tokens.length; i++) {
     bots.push({ 
+        index: i,
         token: tokens[i], 
         serverId: serverIds[i], 
         client: null, 
@@ -63,6 +67,14 @@ for (let i = 0; i < tokens.length; i++) {
         bumping: false, 
         bumpTimer: null 
     })
+    if (!serverState.has(serverIds[i])) {
+        serverState.set(serverIds[i], {
+            lastBumpAt: null,
+            nextBumpAt: null,
+            channelId: null,
+            lastHandledMessageId: null
+        })
+    }
 }
 
 console.log(`Loaded ${bots.length} bot(s) - auto-paired tokens with server IDs`)
@@ -99,34 +111,36 @@ async function startBots() {
             // .b - Start bumping in this channel
             if (command === 'b') {
                 await message.delete().catch(() => {})
-                
-                if (bot.bumping) {
-                    console.log(`[${client.user.tag}] Already bumping in ${bot.guild?.name}!`)
-                    return
+
+                // Sync all bots in this server to the same channel
+                const sameServerBots = bots.filter(b => b.serverId === bot.serverId)
+                for (const b of sameServerBots) {
+                    b.channel = message.channel
+                    b.bumping = true
                 }
 
-                // Use the channel where command was sent
-                bot.channel = message.channel
-                bot.bumping = true
                 console.log(`[${client.user.tag}] Starting bump loop for ${bot.guild?.name} in #${message.channel.name}...`)
-                
-                // Bump immediately
+
+                // Bump immediately using the bot that received the command
                 await sendBump(bot)
-                
-                // Schedule next bumps
-                scheduleBump(bot)
+
+                // Schedule next bumps for everyone in this server
+                scheduleNextBumpForServer(bot.serverId, DEFAULT_BUMP_INTERVAL_MS, 'manual start')
             }
 
             // .stop - Stop bumping
             if (command === 'stop') {
                 await message.delete().catch(() => {})
-                
-                if (bot.bumpTimer) {
-                    clearTimeout(bot.bumpTimer)
-                    bot.bumpTimer = null
+
+                const sameServerBots = bots.filter(b => b.serverId === bot.serverId)
+                for (const b of sameServerBots) {
+                    if (b.bumpTimer) {
+                        clearTimeout(b.bumpTimer)
+                        b.bumpTimer = null
+                    }
+                    b.bumping = false
                 }
-                bot.bumping = false
-                console.log(`[${client.user.tag}] Stopped bumping.`)
+                console.log(`[${client.user.tag}] Stopped bumping for ${bot.guild?.name}.`)
             }
 
             // .setup [invite_link] - Delete all channels, create info channel with invite, create private bump channel
@@ -163,7 +177,13 @@ async function startBots() {
                     // Create info channel (public)
                     const infoChannel = await guild.channels.create('info', {
                         type: 'GUILD_TEXT',
-                        topic: 'Server Information'
+                        topic: 'Server Information',
+                        permissionOverwrites: [
+                            {
+                                id: guild.id, // @everyone role
+                                deny: ['SEND_MESSAGES']
+                            }
+                        ]
                     })
 
                     // Send invite link
@@ -176,7 +196,7 @@ async function startBots() {
                         permissionOverwrites: [
                             {
                                 id: guild.id, // @everyone role
-                                deny: ['VIEW_CHANNEL']
+                                deny: ['VIEW_CHANNEL', 'SEND_MESSAGES']
                             },
                             {
                                 id: guild.ownerId, // Server owner
@@ -218,6 +238,34 @@ async function startBots() {
                     console.log(`[Bot ${j + 1}] ${user} | ${server} | #${channel} | ${status}`)
                 }
                 console.log(`==================\n`)
+            }
+        })
+
+        // Watch DISBOARD responses to keep bump timers in sync
+        client.on('messageCreate', async (message) => {
+            if (!message.guild) return
+            if (message.author?.id !== DISBOARD_BOT_ID) return
+            if (message.guild.id !== bot.serverId) return
+
+            const state = serverState.get(bot.serverId)
+            if (!state || state.lastHandledMessageId === message.id) return
+            state.lastHandledMessageId = message.id
+
+            const waitMs = extractWaitMs(message)
+            const isBumpDone = isBumpDoneMessage(message)
+
+            if (message.channel?.id) {
+                state.channelId = message.channel.id
+            }
+
+            if (isBumpDone) {
+                state.lastBumpAt = Date.now()
+                scheduleNextBumpForServer(bot.serverId, TWO_HOURS_MS, 'bump done')
+                return
+            }
+
+            if (waitMs !== null) {
+                scheduleNextBumpForServer(bot.serverId, waitMs, 'cooldown detected')
             }
         })
 
@@ -278,20 +326,73 @@ async function sendBump(bot) {
     }
 }
 
-function scheduleBump(bot) {
-    if (!bot.bumping) return
-    
-    const randomDelay = TWO_HOURS_MS + Math.floor(Math.random() * RANDOM_DELAY_MS)
-    const nextBumpTime = new Date(Date.now() + randomDelay)
-    
-    console.log(`[${bot.client.user.tag}] Next bump at: ${nextBumpTime.toLocaleString()}`)
-    
-    bot.bumpTimer = setTimeout(async () => {
-        if (bot.bumping) {
-            await sendBump(bot)
-            scheduleBump(bot)
+function scheduleNextBumpForServer(serverId, delayMs, reason) {
+    const state = serverState.get(serverId)
+    if (!state) return
+
+    const nextDelay = Math.max(10 * 1000, delayMs + Math.floor(Math.random() * RANDOM_DELAY_MS))
+    state.nextBumpAt = Date.now() + nextDelay
+
+    const sameServerBots = bots.filter(b => b.serverId === serverId)
+    for (const b of sameServerBots) {
+        if (!b.bumping) continue
+
+        if (b.bumpTimer) {
+            clearTimeout(b.bumpTimer)
+            b.bumpTimer = null
         }
-    }, randomDelay)
+
+        b.bumpTimer = setTimeout(async () => {
+            if (!b.bumping) return
+
+            const leader = getLeaderBot(serverId)
+            if (!leader || leader.index !== b.index) return
+
+            await sendBump(b)
+            scheduleNextBumpForServer(serverId, DEFAULT_BUMP_INTERVAL_MS, 'default cycle')
+        }, nextDelay)
+    }
+
+    const leader = getLeaderBot(serverId)
+    if (leader?.client?.user?.tag) {
+        const nextBumpTime = new Date(state.nextBumpAt)
+        console.log(`[${leader.client.user.tag}] Next bump at: ${nextBumpTime.toLocaleString()} (${reason})`)
+    }
+}
+
+function getLeaderBot(serverId) {
+    const sameServerBots = bots.filter(b => b.serverId === serverId)
+    return sameServerBots.find(b => b.bumping && b.channel)
+}
+
+function isBumpDoneMessage(message) {
+    const text = extractMessageText(message)
+    return text.includes('bump done') || text.includes('successfully bumped')
+}
+
+function extractWaitMs(message) {
+    const text = extractMessageText(message)
+    const waitMatch = text.match(/wait\s+(?:another\s+)?(?:(\d+)\s*hour[s]?)?\s*(?:(\d+)\s*minute[s]?)?/)
+    if (!waitMatch) return null
+
+    const hours = waitMatch[1] ? parseInt(waitMatch[1], 10) : 0
+    const minutes = waitMatch[2] ? parseInt(waitMatch[2], 10) : 0
+    if (hours === 0 && minutes === 0) return null
+
+    return (hours * 60 * 60 * 1000) + (minutes * 60 * 1000)
+}
+
+function extractMessageText(message) {
+    const parts = []
+    if (message.content) parts.push(message.content)
+    if (message.embeds && message.embeds.length > 0) {
+        for (const embed of message.embeds) {
+            if (embed.title) parts.push(embed.title)
+            if (embed.description) parts.push(embed.description)
+            if (embed.footer?.text) parts.push(embed.footer.text)
+        }
+    }
+    return parts.join(' ').toLowerCase()
 }
 
 // Start
