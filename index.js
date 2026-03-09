@@ -11,7 +11,6 @@ const PREFIX = '.'
 
 // Read tokens from tokens.txt (one token per line)
 const tokensPath = path.join(__dirname, 'tokens.txt')
-const idsPath = path.join(__dirname, 'id.txt')
 
 if (!fs.existsSync(tokensPath)) {
     console.error('ERROR: tokens.txt not found!')
@@ -19,35 +18,15 @@ if (!fs.existsSync(tokensPath)) {
     process.exit(1)
 }
 
-if (!fs.existsSync(idsPath)) {
-    console.error('ERROR: id.txt not found!')
-    console.error('Create id.txt with one server ID per line')
-    process.exit(1)
-}
 
 const tokens = fs.readFileSync(tokensPath, 'utf-8')
     .split('\n')
     .map(line => line.trim())
     .filter(line => line && !line.startsWith('#'))
 
-const serverIds = fs.readFileSync(idsPath, 'utf-8')
-    .split('\n')
-    .map(line => line.trim())
-    .filter(line => line && !line.startsWith('#'))
 
 if (tokens.length === 0) {
     console.error('ERROR: No tokens found in tokens.txt')
-    process.exit(1)
-}
-
-if (serverIds.length === 0) {
-    console.error('ERROR: No server IDs found in id.txt')
-    process.exit(1)
-}
-
-if (tokens.length !== serverIds.length) {
-    console.error(`ERROR: Mismatch! ${tokens.length} tokens but ${serverIds.length} server IDs`)
-    console.error('Each token needs exactly one server ID')
     process.exit(1)
 }
 
@@ -55,29 +34,21 @@ if (tokens.length !== serverIds.length) {
 const bots = []
 const serverState = new Map()
 
-// Pair tokens with server IDs
+// Pair tokens with bot instances
 for (let i = 0; i < tokens.length; i++) {
     bots.push({ 
         index: i,
         token: tokens[i], 
-        serverId: serverIds[i], 
+        serverId: null,
         client: null, 
         guild: null,
         channel: null,  // Channel to bump in (set when .b is run)
         bumping: false, 
         bumpTimer: null 
     })
-    if (!serverState.has(serverIds[i])) {
-        serverState.set(serverIds[i], {
-            lastBumpAt: null,
-            nextBumpAt: null,
-            channelId: null,
-            lastHandledMessageId: null
-        })
-    }
 }
 
-console.log(`Loaded ${bots.length} bot(s) - auto-paired tokens with server IDs`)
+console.log(`Loaded ${bots.length} bot(s) - server IDs are set when you run .b or .setup`)
 
 // Start all bots
 async function startBots() {
@@ -90,10 +61,9 @@ async function startBots() {
             console.log(`[Bot ${i + 1}] Logged in as ${client.user.tag}`)
             
             try {
-                bot.guild = await client.guilds.fetch(bot.serverId)
-                console.log(`[Bot ${i + 1}] Assigned to server: ${bot.guild.name}`)
+                console.log(`[Bot ${i + 1}] Logged in and ready for commands.`)
             } catch (err) {
-                console.error(`[Bot ${i + 1}] Could not fetch server ${bot.serverId}: ${err.message}`)
+                console.error(`[Bot ${i + 1}] Ready handler error: ${err.message}`)
             }
         })
 
@@ -103,7 +73,7 @@ async function startBots() {
             if (!message.content.startsWith(PREFIX)) return
             
             // Only respond to commands in the assigned server
-            if (message.guild.id !== bot.serverId) return
+            if (bot.serverId && message.guild.id !== bot.serverId) return
 
             const args = message.content.slice(PREFIX.length).trim().split(/ +/)
             const command = args.shift().toLowerCase()
@@ -111,6 +81,20 @@ async function startBots() {
             // .b - Start bumping in this channel
             if (command === 'b') {
                 await message.delete().catch(() => {})
+
+                if (!bot.serverId) {
+                    bot.serverId = message.guild.id
+                    bot.guild = message.guild
+                }
+
+                if (!serverState.has(bot.serverId)) {
+                    serverState.set(bot.serverId, {
+                        lastBumpAt: null,
+                        nextBumpAt: null,
+                        channelId: null,
+                        lastHandledMessageId: null
+                    })
+                }
 
                 // Sync all bots in this server to the same channel
                 const sameServerBots = bots.filter(b => b.serverId === bot.serverId)
@@ -155,6 +139,20 @@ async function startBots() {
 
                 const guild = message.guild
                 if (!guild) return
+
+                if (!bot.serverId) {
+                    bot.serverId = guild.id
+                    bot.guild = guild
+                }
+
+                if (!serverState.has(bot.serverId)) {
+                    serverState.set(bot.serverId, {
+                        lastBumpAt: null,
+                        nextBumpAt: null,
+                        channelId: null,
+                        lastHandledMessageId: null
+                    })
+                }
 
                 console.log(`[${client.user.tag}] Running setup on ${guild.name}...`)
 
@@ -245,7 +243,7 @@ async function startBots() {
         client.on('messageCreate', async (message) => {
             if (!message.guild) return
             if (message.author?.id !== DISBOARD_BOT_ID) return
-            if (message.guild.id !== bot.serverId) return
+            if (bot.serverId && message.guild.id !== bot.serverId) return
 
             const state = serverState.get(bot.serverId)
             if (!state || state.lastHandledMessageId === message.id) return
